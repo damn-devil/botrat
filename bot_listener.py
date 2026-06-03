@@ -166,6 +166,7 @@ async def health_handler(request):
 
 
 async def admin_ws_handler(request):
+    global current_client
     ws = web.WebSocketResponse()
     await ws.prepare(request)
 
@@ -197,7 +198,6 @@ async def admin_ws_handler(request):
         elif text.startswith("select:"):
             cid = int(text[7:])
             if cid in clients:
-                global current_client
                 current_client = cid
                 interactive = False
                 await ws.send_str(f"selected:{cid}")
