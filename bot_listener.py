@@ -483,7 +483,6 @@ async def run_http_server():
     app.router.add_get("/health", health_handler)
     app.router.add_get("/ws", ws_handler)
     app.router.add_get("/admin/ws", admin_ws_handler)
-    app.router.add_get("/admin/ws", admin_ws_handler)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", LISTENER_PORT)
