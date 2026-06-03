@@ -80,23 +80,23 @@ async def ws_handler(request):
         if was_first:
             await send_to_telegram(uid, f"\u2705 Клиент [{client_id}] выбран как текущий")
 
+    flush_task = asyncio.create_task(buffer_flush_loop(client_id))
+    clients[client_id]["flush_task"] = flush_task
+
     try:
         async for msg in ws:
             if msg.type == WSMsgType.TEXT:
-                text = msg.data
                 cl = clients.get(client_id)
                 if cl:
-                    cl["buffer"] += text
-                    if current_client == client_id and cl["buffer"].strip():
-                        for uid in ALLOWED_USERS:
-                            await send_to_telegram(uid, f"```\n{cl['buffer'].strip()}\n```", parse_mode="Markdown")
-                        cl["buffer"] = ""
+                    cl["buffer"] += msg.data
             elif msg.type == WSMsgType.ERROR:
                 break
     except Exception:
         pass
 
+    flush_task.cancel()
     if client_id in clients:
+        clients[client_id].pop("flush_task", None)
         del clients[client_id]
         log(f"[-] Client [{client_id}] disconnected")
         for uid in ALLOWED_USERS:
@@ -108,6 +108,21 @@ async def ws_handler(request):
                     await send_to_telegram(uid, f"\U0001f504 Автоматически выбран клиент [{current_client}]")
 
     return ws
+
+
+async def buffer_flush_loop(client_id):
+    try:
+        while client_id in clients:
+            await asyncio.sleep(0.5)
+            cl = clients.get(client_id)
+            if cl and cl["buffer"].strip():
+                buf = cl["buffer"]
+                cl["buffer"] = ""
+                if current_client == client_id:
+                    for uid in ALLOWED_USERS:
+                        await send_to_telegram(uid, f"```\n{buf.strip()}\n```", parse_mode="Markdown")
+    except asyncio.CancelledError:
+        pass
 
 
 async def health_handler(request):
